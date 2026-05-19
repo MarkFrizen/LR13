@@ -1,0 +1,36 @@
+# =============================================================================
+# OpenTelemetry Collector — маршрутизация трассировок в Jaeger
+#
+# Получает:
+#   - Jaeger Thrift HTTP (порт 14268) — от Go-агентов
+#   - OTLP gRPC (порт 4317) — от Python-оркестратора
+#
+# Отправляет:
+#   - OTLP gRPC → Jaeger all-in-one (порт 4317)
+# =============================================================================
+
+receivers:
+  # Приём трассировок от Go-агентов (Jaeger Thrift HTTP).
+  jaeger:
+    protocols:
+      thrift_http:
+        endpoint: 0.0.0.0:14268
+
+  # Приём трассировок от Python-оркестратора (OTLP gRPC).
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+exporters:
+  # Экспорт в Jaeger по OTLP gRPC.
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [jaeger, otlp]
+      exporters: [otlp/jaeger]

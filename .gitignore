@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# IDE
+.idea/
+
+# Streamlit (local config — может содержать secrets)
+.streamlit/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Docker
+.docker/
+
+# macOS
+.DS_Store
+
+# AI assistant (Qwen)
+.qwen/
+
+# Logs
+*.log
