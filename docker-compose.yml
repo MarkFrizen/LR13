@@ -281,3 +281,26 @@ services:
     networks:
       - marketing-net
     restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Streamlit-дашборд
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: ./cmd/dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      NATS_URL: "nats://nats:4222"
+      NATS_HTTP: "http://nats:8222"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
