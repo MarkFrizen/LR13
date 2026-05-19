@@ -296,6 +296,8 @@ services:
       NATS_URL: "nats://nats:4222"
       NATS_HTTP: "http://nats:8222"
       REDIS_URL: "redis://redis:6379/0"
+      ORCHESTRATOR_URL: "http://orchestrator:8000"
+      JAEGER_UI_URL: "http://localhost:16686"
     depends_on:
       nats:
         condition: service_healthy
