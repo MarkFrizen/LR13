@@ -29,6 +29,7 @@ volumes:
   nats-data:
   redis-data:
   jaeger-data:
+  ollama-data:
 
 # =============================================================================
 # Секция: services
@@ -216,6 +217,41 @@ services:
       nats:
         condition: service_healthy
       redis:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Ollama — локальная LLM (генерация текста)
+  # ---------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    environment:
+      OLLAMA_HOST: "0.0.0.0"
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # LLM-генератор текста рассылок
+  # ---------------------------------------------------------------------------
+  llm_generator:
+    build:
+      context: ./cmd/agents/llm_generator
+      dockerfile: Dockerfile
+    container_name: llm-generator
+    environment:
+      NATS_URL: "nats://nats:4222"
+      OLLAMA_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "llama3"
+    depends_on:
+      nats:
         condition: service_healthy
     networks:
       - marketing-net
