@@ -1,12 +1,19 @@
 # =============================================================================
 # docker-compose.yml — Маркетинговая мультиагентная платформа
 #
+# Схема трассировки:
+#   Go-агенты ──Jaeger Thrift HTTP──► otel-collector (:14268)
+#   Оркестратор ──OTLP gRPC─────────► otel-collector (:4317)
+#                                     │
+#                                     ▼ OTLP gRPC
+#                                   Jaeger all-in-one (:4317)
+#
 # Запуск:
-#   docker compose up -d                                         # по 1 экземпляру каждого агента
-#   docker compose up -d --scale segmentation=3 --scale campaign=2   # масштабирование
+#   docker compose up -d
+#   docker compose up -d --scale segmentation=3 --scale campaign=2
 #   curl -X POST http://localhost:8000/pipeline -H 'Content-Type: application/json' -d @test.json
-#   docker compose logs -f                                       # просмотр логов
-#   docker compose down                                          # остановка
+#   docker compose logs -f
+#   docker compose down
 # =============================================================================
 
 version: "3.9"
@@ -35,8 +42,8 @@ services:
     image: nats:2.10-alpine
     container_name: nats-broker
     ports:
-      - "4222:4222"   # Клиентское подключение
-      - "8222:8222"   # HTTP-мониторинг
+      - "4222:4222"
+      - "8222:8222"
     volumes:
       - nats-data:/data
     command:
@@ -72,20 +79,36 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Jaeger (сборка трассировок OpenTelemetry)
+  # Jaeger — хранилище и UI трассировок
   # ---------------------------------------------------------------------------
   jaeger:
     image: jaegertracing/all-in-one:latest
     container_name: jaeger
     ports:
-      - "16686:16686"  # UI
-      - "4318:4318"    # OTLP HTTP
-      - "14268:14268"  # Jaeger Thrift HTTP (для Go-агентов)
-      - "14250:14250"  # Jaeger gRPC
+      - "16686:16686"       # UI (http://localhost:16686)
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     volumes:
       - jaeger-data:/tmp
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # OpenTelemetry Collector — агрегация трассировок
+  # ---------------------------------------------------------------------------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    ports:
+      - "14268:14268"       # Jaeger Thrift HTTP ← Go-агенты
+      - "4317:4317"         # OTLP gRPC ← оркестратор
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml:ro
+    command:
+      - "--config=/etc/otel-collector-config.yml"
+    depends_on:
+      - jaeger
     networks:
       - marketing-net
     restart: unless-stopped
@@ -102,15 +125,13 @@ services:
     container_name: agent-segmentation
     environment:
       NATS_URL: "nats://nats:4222"
+      JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
     depends_on:
       nats:
         condition: service_healthy
     networks:
       - marketing-net
     restart: unless-stopped
-    # Масштабирование: docker compose up -d --scale segmentation=N
-    # deploy:
-    #   replicas: 2
 
   # ---------------------------------------------------------------------------
   # Агент создания рассылок
@@ -124,6 +145,7 @@ services:
     container_name: agent-campaign
     environment:
       NATS_URL: "nats://nats:4222"
+      JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
     depends_on:
       nats:
         condition: service_healthy
@@ -143,6 +165,7 @@ services:
     container_name: agent-analytics
     environment:
       NATS_URL: "nats://nats:4222"
+      JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
     depends_on:
       nats:
         condition: service_healthy
@@ -162,6 +185,7 @@ services:
     container_name: agent-optimizer
     environment:
       NATS_URL: "nats://nats:4222"
+      JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
     depends_on:
       nats:
         condition: service_healthy
@@ -182,8 +206,7 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       REDIS_URL: "redis://redis:6379/0"
-      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
-      JAEGER_ENDPOINT: "http://jaeger:14268/api/traces"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
     depends_on:
       nats:
         condition: service_healthy

@@ -108,12 +108,24 @@
 **Промпт:** "Настрой оркестратор Python для отправки трассировок в Jaeger. Используй opentelemetry-instrumentation-fastapi, добавь middleware, которая создаёт root span для каждого HTTP-запроса. Также оберни вызовы NATS в spans."
 **Результат:** 
 ### Промпт 3
-**Промпт:** ""
-**Результат:** 
+**Промпт:** "Создай docker-compose сервис для Jaeger (all-in-one) и OpenTelemetry Collector. Настрой приёма трассировок от агентов (HTTP) и оркестратора (gRPC). Добавь переменные окружения для всех сервисов (OTEL_EXPORTER_OTLP_ENDPOINT)."
+**Результат:** Итоговая архитектура трассировки
+
+      1                          ┌──────────────────┐
+      2 Go Agent ──HTTP Thrift──►│                  │
+      3   segment                │  otel-collector  │──OTLP gRPC──► Jaeger
+      4   campaign  ──HTTP──►    │  (contrib)       │              all-in-one
+      5   analytics ──HTTP──►    │  :14268 / :4317  │              :16686 (UI)
+      6   optimizer ──HTTP──►    │                  │
+      7                          └──────────────────┘
+      8                                ▲
+      9 Python Orchestrator ──OTLP────┘
+     10   (gRPC :4317)
+
 ### Итого
 - Количество промптов: 3
 - Что пришлось исправлять вручную: ничего
-- Время: ~15 мин
+- Время: ~20 мин
 
 ## Задание 4: Агент с состоянием (Redis).
 ### Промпт 1
