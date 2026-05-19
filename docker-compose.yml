@@ -271,6 +271,8 @@ services:
       NATS_URL: "nats://nats:4222"
       REDIS_URL: "redis://redis:6379/0"
       OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+      USE_LLM: "true"           # генерация текста через LLM (ollama)
+      CAMPAIGN_MESSAGE_TEMPLATE: "Здравствуйте! Специальное предложение для вас."
     depends_on:
       nats:
         condition: service_healthy
