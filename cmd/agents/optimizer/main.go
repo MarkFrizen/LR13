@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"os"
@@ -14,20 +15,25 @@ import (
 )
 
 const (
-	defaultNATSURL    = "nats://localhost:4222"
-	subscribeSubject  = "tasks.process"
-	publishSubject    = "tasks.completed"
-	errorSubject      = "tasks.error"
-	taskTypeOptimizer = "optimizer"
+	defaultNATSURL     = "nats://localhost:4222"
+	subscribeSubject   = "tasks.process"
+	publishSubject     = "tasks.completed"
+	errorSubject       = "tasks.error"
+	auctionSubject     = "auction.tasks"
+	taskTypeOptimizer  = "optimizer"
 	maxBudgetChangePct = 20.0
 )
 
+// Task — входящая задача из очереди.
 type Task struct {
-	TaskID  string        `json:"task_id"`
-	Type    string        `json:"type"`
-	Payload interface{}   `json:"payload,omitempty"`
+	TaskID         string      `json:"task_id"`
+	Type           string      `json:"type"`
+	TargetAgentID  string      `json:"target_agent_id,omitempty"`
+	Complexity     int         `json:"complexity,omitempty"`
+	Payload        interface{} `json:"payload,omitempty"`
 }
 
+// OptimizerResult — результат оптимизации.
 type OptimizerResult struct {
 	TaskID        string  `json:"task_id"`
 	Type          string  `json:"type"`
@@ -37,6 +43,38 @@ type OptimizerResult struct {
 	OldBudget     float64 `json:"old_budget,omitempty"`
 	ChangePercent float64 `json:"change_percent,omitempty"`
 	Adjustment    string  `json:"adjustment,omitempty"`
+	AgentID       string  `json:"agent_id,omitempty"`
+}
+
+// Bid — ставка агента на аукционе.
+type Bid struct {
+	TaskID           string  `json:"task_id"`
+	AgentID          string  `json:"agent_id"`
+	Cost             float64 `json:"cost"`
+	BaseCost         float64 `json:"base_cost"`
+	ComplexityFactor float64 `json:"complexity_factor"`
+}
+
+// agentID — уникальный идентификатор этого экземпляра агента.
+var agentID string
+
+// Параметры стоимости (разные для каждого экземпляра).
+var (
+	baseCost         float64
+	complexityFactor float64
+)
+
+func init() {
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "optimizer"
+	}
+	suffix := fmt.Sprintf("%06x", rand.Int31n(0xFFFFFF))
+	agentID = fmt.Sprintf("%s-%s", hostname, suffix)
+
+	// Каждый агент имеет случайную базовую стоимость и коэффициент сложности.
+	baseCost = 5.0 + rand.Float64()*10.0          // 5.0 .. 15.0
+	complexityFactor = 0.5 + rand.Float64()*1.5    // 0.5 .. 2.0
 }
 
 func main() {
@@ -44,7 +82,11 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	slog.Info("запуск агента оптимизации")
+	slog.Info("запуск агента оптимизации",
+		"agent_id", agentID,
+		"base_cost", fmt.Sprintf("%.2f", baseCost),
+		"complexity_factor", fmt.Sprintf("%.2f", complexityFactor),
+	)
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -62,17 +104,29 @@ func main() {
 	defer nc.Close()
 	slog.Info("подключение к NATS установлено", "url", natsURL)
 
-	sub, err := nc.Subscribe(subscribeSubject, func(msg *nats.Msg) {
+	// Основная очередь задач.
+	taskSub, err := nc.Subscribe(subscribeSubject, func(msg *nats.Msg) {
 		handleTask(nc, msg)
 	})
 	if err != nil {
 		slog.Error("ошибка подписки", "subject", subscribeSubject, "error", err)
 		os.Exit(1)
 	}
-	defer sub.Unsubscribe()
+	defer taskSub.Unsubscribe()
+
+	// Аукционная очередь — получение запросов на торги.
+	auctionSub, err := nc.Subscribe(auctionSubject, func(msg *nats.Msg) {
+		handleAuctionTask(nc, msg)
+	})
+	if err != nil {
+		slog.Error("ошибка подписки на аукцион", "subject", auctionSubject, "error", err)
+		os.Exit(1)
+	}
+	defer auctionSub.Unsubscribe()
 
 	slog.Info("агент ожидает задачи",
 		"subscribe", subscribeSubject,
+		"auction", auctionSubject,
 		"task_type", taskTypeOptimizer,
 	)
 
@@ -84,6 +138,53 @@ func main() {
 	slog.Info("агент завершил работу")
 }
 
+// handleAuctionTask обрабатывает запрос на аукцион.
+// Агент вычисляет свою ставку и публикует её в reply-канал.
+func handleAuctionTask(nc *nats.Conn, msg *nats.Msg) {
+	var task Task
+	if err := json.Unmarshal(msg.Data, &task); err != nil {
+		slog.Warn("аукцион: невалидная задача", "error", err)
+		return
+	}
+
+	complexity := task.Complexity
+	if complexity <= 0 {
+		complexity = 5 // значение по умолчанию
+	}
+
+	cost := baseCost + float64(complexity)*complexityFactor
+
+	bid := Bid{
+		TaskID:           task.TaskID,
+		AgentID:          agentID,
+		Cost:             cost,
+		BaseCost:         baseCost,
+		ComplexityFactor: complexityFactor,
+	}
+
+	data, err := json.Marshal(bid)
+	if err != nil {
+		slog.Error("аукцион: ошибка сериализации ставки", "error", err)
+		return
+	}
+
+	// Публикуем ставку в reply-канал.
+	if msg.Reply != "" {
+		if err := nc.Publish(msg.Reply, data); err != nil {
+			slog.Error("аукцион: ошибка публикации ставки", "error", err)
+			return
+		}
+	}
+
+	slog.Info("аукцион: ставка отправлена",
+		"task_id", task.TaskID,
+		"agent_id", agentID,
+		"cost", fmt.Sprintf("%.2f", cost),
+	)
+}
+
+// handleTask обрабатывает задачу из tasks.process.
+// Если задача содержит target_agent_id — обрабатываем только свою.
 func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	log := slog.With("subject", msg.Subject)
 
@@ -96,8 +197,17 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 
 	log = log.With("task_id", task.TaskID, "type", task.Type)
 
+	// Фильтр по типу.
 	if task.Type != taskTypeOptimizer {
 		log.Warn("пропуск задачи — неверный тип")
+		return
+	}
+
+	// Фильтр по целевому агенту (аукцион).
+	if task.TargetAgentID != "" && task.TargetAgentID != agentID {
+		log.Debug("пропуск задачи — предназначена другому агенту",
+			"target", task.TargetAgentID, "self", agentID,
+		)
 		return
 	}
 
@@ -105,7 +215,7 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 
 	// Симуляция оптимизации бюджета.
 	oldBudget := float64(rand.Intn(90000) + 10000)
-	change := (rand.Float64()*2 - 1) * maxBudgetChangePct // -20% .. +20%
+	change := (rand.Float64()*2 - 1) * maxBudgetChangePct
 	newBudget := oldBudget * (1 + change/100)
 
 	result := OptimizerResult{
@@ -115,6 +225,7 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		OldBudget:     oldBudget,
 		NewBudget:     newBudget,
 		ChangePercent: change,
+		AgentID:       agentID,
 	}
 
 	if change > 0 {
@@ -149,7 +260,9 @@ func publishResult(nc *nats.Conn, msg *nats.Msg, result OptimizerResult, log *sl
 		"old_budget", result.OldBudget,
 		"new_budget", result.NewBudget,
 		"change_pct", result.ChangePercent,
-		"adjustment", result.Adjustment)
+		"adjustment", result.Adjustment,
+		"agent_id", result.AgentID,
+	)
 }
 
 func publishError(nc *nats.Conn, reply, taskID, errMsg string) {
