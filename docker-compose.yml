@@ -198,6 +198,30 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
+  # Scaler — автоскейлинг агентов
+  # ---------------------------------------------------------------------------
+  scaler:
+    build:
+      context: .
+      dockerfile: cmd/scaler/Dockerfile
+    container_name: scaler
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+    working_dir: /project
+    environment:
+      NATS_URL: "nats://nats:4222"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Оркестратор (FastAPI)
   # ---------------------------------------------------------------------------
   orchestrator:
