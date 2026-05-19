@@ -4,6 +4,7 @@
 # Запуск:
 #   docker compose up -d                                         # по 1 экземпляру каждого агента
 #   docker compose up -d --scale segmentation=3 --scale campaign=2   # масштабирование
+#   curl -X POST http://localhost:8000/pipeline -H 'Content-Type: application/json' -d @test.json
 #   docker compose logs -f                                       # просмотр логов
 #   docker compose down                                          # остановка
 # =============================================================================
@@ -19,6 +20,7 @@ networks:
 # =============================================================================
 volumes:
   nats-data:
+  redis-data:
 
 # =============================================================================
 # Секция: services
@@ -37,14 +39,33 @@ services:
     volumes:
       - nats-data:/data
     command:
-      - "--jetstream"          # Включаем JetStream (для очередей)
-      - "--store_dir=/data"    # Директория для хранения
-      - "--http_port=8222"     # Порт мониторинга
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Redis (хранение статусов pipeline)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis-store
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
     networks:
       - marketing-net
     restart: unless-stopped
@@ -123,6 +144,28 @@ services:
       NATS_URL: "nats://nats:4222"
     depends_on:
       nats:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Оркестратор (FastAPI)
+  # ---------------------------------------------------------------------------
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: orchestrator
+    ports:
+      - "8000:8000"
+    environment:
+      NATS_URL: "nats://nats:4222"
+      REDIS_URL: "redis://redis:6379/0"
+    depends_on:
+      nats:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     networks:
       - marketing-net
