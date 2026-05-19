@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"log/slog"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const minSegmentSize = 100
@@ -85,5 +88,31 @@ func segmentByRegion(clients []Client) []Segment {
 func segment(clients []Client) []Segment {
 	segments := segmentByAge(clients)
 	segments = append(segments, segmentByRegion(clients)...)
+	return segments
+}
+
+// segmentWithCache выполняет сегментацию с кэшированием в Redis.
+//
+//  1. Вычисляет хеш от списка клиентов → ключ "segment:<hash>".
+//  2. Если ключ есть в Redis — возвращает кэшированные сегменты.
+//  3. Если нет — вызывает segment(), сохраняет результат с TTL 1ч.
+//
+// rdb может быть nil — в этом случае кэш прозрачно пропускается.
+func segmentWithCache(ctx context.Context, rdb *redis.Client, clients []Client) []Segment {
+	key := cacheKey(clients)
+
+	// Попытка чтения из кэша.
+	if cached, ok := getCachedSegments(ctx, rdb, key); ok {
+		return cached
+	}
+
+	slog.Info("кэш Redis: MISS", "key", key)
+
+	// Вычисляем сегменты.
+	segments := segment(clients)
+
+	// Сохраняем в кэш (фоном, чтобы не задерживать ответ).
+	go setCachedSegments(context.WithoutCancel(ctx), rdb, key, segments)
+
 	return segments
 }

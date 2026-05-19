@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -48,6 +49,15 @@ func main() {
 		"endpoint", os.Getenv("JAEGER_ENDPOINT"),
 	)
 
+	// Инициализация Redis (кэш сегментации).
+	rdb := initRedis()
+	if rdb != nil {
+		defer closeRedis(rdb)
+		// Восстановление состояния: загружаем все активные сегменты
+		// из Redis в локальный in-memory кэш.
+		loadCacheFromRedis(rdb)
+	}
+
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = defaultNATSURL
@@ -65,7 +75,7 @@ func main() {
 	slog.Info("подключение к NATS установлено", "url", natsURL)
 
 	sub, err := nc.Subscribe(subscribeSubject, func(msg *nats.Msg) {
-		handleTask(nc, msg)
+		handleTask(nc, rdb, msg)
 	})
 	if err != nil {
 		slog.Error("ошибка подписки на очередь",
@@ -98,7 +108,7 @@ func main() {
 }
 
 // handleTask обрабатывает входящее сообщение из NATS.
-func handleTask(nc *nats.Conn, msg *nats.Msg) {
+func handleTask(nc *nats.Conn, rdb *redis.Client, msg *nats.Msg) {
 	log := slog.With("subject", msg.Subject)
 
 	// Извлекаем контекст трассировки из заголовков NATS-сообщения.
@@ -154,8 +164,8 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Выполнение сегментации.
-	segments := segment(task.Clients)
+	// Выполнение сегментации (с кэшированием в Redis).
+	segments := segmentWithCache(ctx, rdb, task.Clients)
 	log.Info("сегментация завершена", "segments", len(segments))
 
 	span.SetAttributes(attribute.Int("segments_count", len(segments)))
