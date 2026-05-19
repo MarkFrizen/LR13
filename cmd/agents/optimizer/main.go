@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -15,13 +16,15 @@ import (
 )
 
 const (
-	defaultNATSURL     = "nats://localhost:4222"
-	subscribeSubject   = "tasks.process"
-	publishSubject     = "tasks.completed"
-	errorSubject       = "tasks.error"
-	auctionSubject     = "auction.tasks"
-	taskTypeOptimizer  = "optimizer"
-	maxBudgetChangePct = 20.0
+	defaultNATSURL      = "nats://localhost:4222"
+	subscribeSubject    = "tasks.process"
+	publishSubject      = "tasks.completed"
+	errorSubject        = "tasks.error"
+	auctionSubject      = "auction.tasks"
+	taskTypeOptimizer   = "optimizer"
+	maxBudgetChangePct  = 20.0
+	maxActiveTasks      = 5     // максимум одновременных задач
+	refuseCost          = 999999.0  // стоимость отказа (игнорируется аукционером)
 )
 
 // Task — входящая задача из очереди.
@@ -57,6 +60,9 @@ type Bid struct {
 
 // agentID — уникальный идентификатор этого экземпляра агента.
 var agentID string
+
+// activeTasks — количество одновременно выполняемых задач (atomic).
+var activeTasks atomic.Int64
 
 // Параметры стоимости (разные для каждого экземпляра).
 var (
@@ -140,6 +146,7 @@ func main() {
 
 // handleAuctionTask обрабатывает запрос на аукцион.
 // Агент вычисляет свою ставку и публикует её в reply-канал.
+// Если activeTasks > maxActiveTasks — отказывается (cost = refuseCost).
 func handleAuctionTask(nc *nats.Conn, msg *nats.Msg) {
 	var task Task
 	if err := json.Unmarshal(msg.Data, &task); err != nil {
@@ -147,12 +154,23 @@ func handleAuctionTask(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
+	currentLoad := activeTasks.Load()
 	complexity := task.Complexity
 	if complexity <= 0 {
-		complexity = 5 // значение по умолчанию
+		complexity = 5
 	}
 
 	cost := baseCost + float64(complexity)*complexityFactor
+
+	// Отказ при перегрузке.
+	if currentLoad > maxActiveTasks {
+		slog.Warn("аукцион: отказ из-за перегрузки",
+			"task_id", task.TaskID,
+			"active_tasks", currentLoad,
+			"max", maxActiveTasks,
+		)
+		cost = refuseCost
+	}
 
 	bid := Bid{
 		TaskID:           task.TaskID,
@@ -168,7 +186,6 @@ func handleAuctionTask(nc *nats.Conn, msg *nats.Msg) {
 		return
 	}
 
-	// Публикуем ставку в reply-канал.
 	if msg.Reply != "" {
 		if err := nc.Publish(msg.Reply, data); err != nil {
 			slog.Error("аукцион: ошибка публикации ставки", "error", err)
@@ -180,6 +197,7 @@ func handleAuctionTask(nc *nats.Conn, msg *nats.Msg) {
 		"task_id", task.TaskID,
 		"agent_id", agentID,
 		"cost", fmt.Sprintf("%.2f", cost),
+		"active_tasks", currentLoad,
 	)
 }
 
@@ -212,6 +230,14 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	}
 
 	log.Info("получена задача на оптимизацию")
+
+	// Увеличиваем счётчик активных задач.
+	activeTasks.Add(1)
+	currentLoad := activeTasks.Load()
+	log = log.With("active_tasks", currentLoad)
+
+	// Отложенное уменьшение счётчика.
+	defer activeTasks.Add(-1)
 
 	// Симуляция оптимизации бюджета.
 	oldBudget := float64(rand.Intn(90000) + 10000)
