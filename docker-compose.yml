@@ -126,6 +126,7 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
+      REDIS_ADDR: "redis:6379"
     depends_on:
       nats:
         condition: service_healthy
@@ -146,6 +147,7 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
+      REDIS_ADDR: "redis:6379"
     depends_on:
       nats:
         condition: service_healthy
@@ -166,6 +168,7 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
+      REDIS_ADDR: "redis:6379"
     depends_on:
       nats:
         condition: service_healthy
@@ -186,6 +189,7 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       JAEGER_ENDPOINT: "http://otel-collector:14268/api/traces"
+      REDIS_ADDR: "redis:6379"
     depends_on:
       nats:
         condition: service_healthy
