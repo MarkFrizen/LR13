@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
@@ -26,6 +29,24 @@ func main() {
 	})))
 
 	slog.Info("запуск агента сегментации")
+
+	// Инициализация OpenTelemetry (Jaeger exporter).
+	tp, err := initTracer()
+	if err != nil {
+		slog.Error("не удалось инициализировать TracerProvider", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tp.Shutdown(ctx); err != nil {
+			slog.Error("ошибка shutdown TracerProvider", "error", err)
+		}
+	}()
+	slog.Info("TracerProvider инициализирован",
+		"exporter", "jaeger",
+		"endpoint", os.Getenv("JAEGER_ENDPOINT"),
+	)
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -80,12 +101,37 @@ func main() {
 func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	log := slog.With("subject", msg.Subject)
 
+	// Извлекаем контекст трассировки из заголовков NATS-сообщения.
+	propagator := otel.GetTextMapPropagator()
+	carrier := natsHeaderCarrier(msg.Header)
+	ctx := propagator.Extract(context.Background(), carrier)
+
+	// Создаём span для обработки задачи.
+	tracer := otel.Tracer("segment-agent")
+	ctx, span := tracer.Start(ctx, "process_task",
+		trace.WithAttributes(
+			attribute.String("messaging.system", "nats"),
+			attribute.String("messaging.destination", msg.Subject),
+			attribute.String("messaging.protocol", "nats"),
+		),
+	)
+	defer span.End()
+
 	var task Task
 	if err := json.Unmarshal(msg.Data, &task); err != nil {
 		log.Error("ошибка десериализации задачи", "error", err)
-		publishError(nc, msg.Reply, "", "", "невалидный JSON: "+err.Error())
+		span.RecordError(err)
+		span.SetAttributes(attribute.String("error", err.Error()))
+		publishError(ctx, nc, msg.Reply, "", "", "невалидный JSON: "+err.Error())
 		return
 	}
+
+	// Добавляем атрибуты задачи в span.
+	span.SetAttributes(
+		attribute.String("task_id", task.TaskID),
+		attribute.String("task_type", task.Type),
+		attribute.Int("client_count", len(task.Clients)),
+	)
 
 	log = log.With("task_id", task.TaskID, "type", task.Type, "clients", len(task.Clients))
 	log.Info("получена задача на сегментацию")
@@ -93,14 +139,17 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	// Фильтр: обрабатываем только задачи типа "segment".
 	if task.Type != taskTypeSegment {
 		log.Warn("пропуск задачи — неверный тип")
-		publishError(nc, msg.Reply, task.TaskID, task.Type,
+		span.SetAttributes(attribute.String("skip_reason", "wrong type"))
+		publishError(ctx, nc, msg.Reply, task.TaskID, task.Type,
 			"ожидался тип 'segment', получен '"+task.Type+"'")
 		return
 	}
 
 	if len(task.Clients) == 0 {
 		log.Error("пустой список клиентов")
-		publishError(nc, msg.Reply, task.TaskID, task.Type,
+		span.RecordError(nil)
+		span.SetAttributes(attribute.String("error", "empty client list"))
+		publishError(ctx, nc, msg.Reply, task.TaskID, task.Type,
 			"список клиентов пуст")
 		return
 	}
@@ -109,6 +158,8 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 	segments := segment(task.Clients)
 	log.Info("сегментация завершена", "segments", len(segments))
 
+	span.SetAttributes(attribute.Int("segments_count", len(segments)))
+
 	result := Result{
 		TaskID:   task.TaskID,
 		Type:     task.Type,
@@ -116,31 +167,46 @@ func handleTask(nc *nats.Conn, msg *nats.Msg) {
 		Status:   "completed",
 	}
 
-	publishResult(nc, msg, result, log)
+	publishResult(ctx, nc, msg, result, log)
 }
 
-// publishResult публикует успешный результат сегментации.
-// Если msg.Reply не пустой — используем request-reply;
-// иначе публикуем в tasks.completed.
-func publishResult(nc *nats.Conn, msg *nats.Msg, result Result, log *slog.Logger) {
+// publishResult публикует успешный результат сегментации с
+// контекстом трассировки в заголовках NATS-сообщения.
+func publishResult(ctx context.Context, nc *nats.Conn, msg *nats.Msg, result Result, log *slog.Logger) {
 	data, err := json.Marshal(result)
 	if err != nil {
 		log.Error("ошибка сериализации результата", "error", err)
 		return
 	}
 
-	// Request-reply: отвечаем напрямую отправителю.
+	// Формируем заголовки с контекстом трассировки.
+	outHeaders := make(nats.Header)
+	propagator := otel.GetTextMapPropagator()
+	carrier := natsHeaderCarrier(outHeaders)
+	propagator.Inject(ctx, carrier)
+
 	if msg.Reply != "" {
-		if err := msg.Respond(data); err != nil {
-			log.Error("ошибка respond", "reply", msg.Reply, "error", err)
+		// Request-reply: отвечаем напрямую отправителю с заголовками.
+		outMsg := nats.Msg{
+			Subject: msg.Reply,
+			Header:  outHeaders,
+			Data:    data,
+		}
+		if err := nc.PublishMsg(&outMsg); err != nil {
+			log.Error("ошибка publish в reply", "reply", msg.Reply, "error", err)
 		}
 		log.Info("результат отправлен через request-reply",
 			"reply", msg.Reply, "segments", len(result.Segments))
 		return
 	}
 
-	// Публикация в очередь tasks.completed.
-	if err := nc.Publish(publishSubject, data); err != nil {
+	// Публикация в очередь tasks.completed с заголовками.
+	outMsg := nats.Msg{
+		Subject: publishSubject,
+		Header:  outHeaders,
+		Data:    data,
+	}
+	if err := nc.PublishMsg(&outMsg); err != nil {
 		log.Error("ошибка публикации результата",
 			"subject", publishSubject, "error", err)
 		return
@@ -154,10 +220,9 @@ func publishResult(nc *nats.Conn, msg *nats.Msg, result Result, log *slog.Logger
 	}
 }
 
-// publishError публикует ошибку обработки задачи.
-// Если задан reply-канал — отвечаем через request-reply.
-// В любом случае дублируем ошибку в очередь tasks.error.
-func publishError(nc *nats.Conn, reply, taskID, taskType, errMsg string) {
+// publishError публикует ошибку обработки задачи с
+// контекстом трассировки в заголовках NATS-сообщения.
+func publishError(ctx context.Context, nc *nats.Conn, reply, taskID, taskType, errMsg string) {
 	log := slog.With("task_id", taskID)
 
 	result := Result{
@@ -173,16 +238,32 @@ func publishError(nc *nats.Conn, reply, taskID, taskType, errMsg string) {
 		return
 	}
 
+	// Формируем заголовки с контекстом трассировки.
+	outHeaders := make(nats.Header)
+	propagator := otel.GetTextMapPropagator()
+	carrier := natsHeaderCarrier(outHeaders)
+	propagator.Inject(ctx, carrier)
+
 	// Request-reply: отвечаем напрямую отправителю.
 	if reply != "" {
-		if err := nc.Publish(reply, data); err != nil {
+		outMsg := nats.Msg{
+			Subject: reply,
+			Header:  outHeaders,
+			Data:    data,
+		}
+		if err := nc.PublishMsg(&outMsg); err != nil {
 			log.Error("ошибка публикации ошибки в reply",
 				"reply", reply, "error", err)
 		}
 	}
 
 	// Публикация в очередь tasks.error.
-	if err := nc.Publish(errorSubject, data); err != nil {
+	outMsg := nats.Msg{
+		Subject: errorSubject,
+		Header:  outHeaders,
+		Data:    data,
+	}
+	if err := nc.PublishMsg(&outMsg); err != nil {
 		log.Error("ошибка публикации в очередь ошибок",
 			"subject", errorSubject, "error", err)
 	}

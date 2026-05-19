@@ -21,6 +21,7 @@ networks:
 volumes:
   nats-data:
   redis-data:
+  jaeger-data:
 
 # =============================================================================
 # Секция: services
@@ -66,6 +67,25 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Jaeger (сборка трассировок OpenTelemetry)
+  # ---------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686"  # UI
+      - "4318:4318"    # OTLP HTTP
+      - "14268:14268"  # Jaeger Thrift HTTP (для Go-агентов)
+      - "14250:14250"  # Jaeger gRPC
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    volumes:
+      - jaeger-data:/tmp
     networks:
       - marketing-net
     restart: unless-stopped
@@ -162,6 +182,8 @@ services:
     environment:
       NATS_URL: "nats://nats:4222"
       REDIS_URL: "redis://redis:6379/0"
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318/v1/traces"
+      JAEGER_ENDPOINT: "http://jaeger:14268/api/traces"
     depends_on:
       nats:
         condition: service_healthy
