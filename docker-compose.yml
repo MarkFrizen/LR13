@@ -16,8 +16,6 @@
 #   docker compose down
 # =============================================================================
 
-version: "3.9"
-
 networks:
   marketing-net:
     driver: bridge
@@ -287,8 +285,8 @@ services:
   # ---------------------------------------------------------------------------
   dashboard:
     build:
-      context: ./cmd/dashboard
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: cmd/dashboard/Dockerfile
     container_name: dashboard
     ports:
       - "8501:8501"
