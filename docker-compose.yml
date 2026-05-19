@@ -1,0 +1,129 @@
+# =============================================================================
+# docker-compose.yml — Маркетинговая мультиагентная платформа
+#
+# Запуск:
+#   docker compose up -d                                         # по 1 экземпляру каждого агента
+#   docker compose up -d --scale segmentation=3 --scale campaign=2   # масштабирование
+#   docker compose logs -f                                       # просмотр логов
+#   docker compose down                                          # остановка
+# =============================================================================
+
+version: "3.9"
+
+networks:
+  marketing-net:
+    driver: bridge
+
+# =============================================================================
+# Секция: volumes
+# =============================================================================
+volumes:
+  nats-data:
+
+# =============================================================================
+# Секция: services
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # Брокер сообщений NATS
+  # ---------------------------------------------------------------------------
+  nats:
+    image: nats:2.10-alpine
+    container_name: nats-broker
+    ports:
+      - "4222:4222"   # Клиентское подключение
+      - "8222:8222"   # HTTP-мониторинг
+    volumes:
+      - nats-data:/data
+    command:
+      - "--jetstream"          # Включаем JetStream (для очередей)
+      - "--store_dir=/data"    # Директория для хранения
+      - "--http_port=8222"     # Порт мониторинга
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Агент сегментации аудитории
+  # ---------------------------------------------------------------------------
+  segmentation:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AGENT: segment
+    container_name: agent-segmentation
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+    # Масштабирование: docker compose up -d --scale segmentation=N
+    # deploy:
+    #   replicas: 2
+
+  # ---------------------------------------------------------------------------
+  # Агент создания рассылок
+  # ---------------------------------------------------------------------------
+  campaign:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AGENT: campaign
+    container_name: agent-campaign
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Агент анализа отклика
+  # ---------------------------------------------------------------------------
+  analytics:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AGENT: analytics
+    container_name: agent-analytics
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Агент оптимизации кампаний
+  # ---------------------------------------------------------------------------
+  optimizer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        AGENT: optimizer
+    container_name: agent-optimizer
+    environment:
+      NATS_URL: "nats://nats:4222"
+    depends_on:
+      nats:
+        condition: service_healthy
+    networks:
+      - marketing-net
+    restart: unless-stopped

@@ -1,8 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,76 +13,101 @@ import (
 )
 
 const (
-	defaultNATSURL  = "nats://localhost:4222"
+	defaultNATSURL    = "nats://localhost:4222"
 	subscribeSubject  = "tasks.process"
 	publishSubject    = "tasks.completed"
+	errorSubject      = "tasks.error"
 	taskTypeSegment   = "segment"
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("[segment-agent] запуск...")
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
+	slog.Info("запуск агента сегментации")
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
 		natsURL = defaultNATSURL
 	}
 
-	// Подключение к NATS с переподключением.
-	nc, err := nats.Connect(natsURL, nats.ReconnectWait(2*time.Second), nats.MaxReconnects(-1))
+	nc, err := nats.Connect(natsURL,
+		nats.ReconnectWait(2*time.Second),
+		nats.MaxReconnects(-1),
+	)
 	if err != nil {
-		log.Fatalf("[segment-agent] не удалось подключиться к NATS: %v", err)
+		slog.Error("не удалось подключиться к NATS", "error", err)
+		os.Exit(1)
 	}
 	defer nc.Close()
-	log.Printf("[segment-agent] подключён к NATS: %s", natsURL)
+	slog.Info("подключение к NATS установлено", "url", natsURL)
 
-	// Подписка на очередь tasks.process.
 	sub, err := nc.Subscribe(subscribeSubject, func(msg *nats.Msg) {
-		handleTask(msg)
+		handleTask(nc, msg)
 	})
 	if err != nil {
-		log.Fatalf("[segment-agent] ошибка подписки на %s: %v", subscribeSubject, err)
+		slog.Error("ошибка подписки на очередь",
+			"subject", subscribeSubject,
+			"error", err,
+		)
+		os.Exit(1)
 	}
 	defer func() {
 		if err := sub.Unsubscribe(); err != nil {
-			log.Printf("[segment-agent] ошибка отписки: %v", err)
+			slog.Error("ошибка отписки", "error", err)
 		}
 	}()
-	log.Printf("[segment-agent] подписан на %s, ожидание задач типа '%s'...", subscribeSubject, taskTypeSegment)
 
-	// Graceful shutdown.
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-	log.Println("[segment-agent] завершение работы...")
+	slog.Info("агент ожидает задачи",
+		"subscribe", subscribeSubject,
+		"publish", publishSubject,
+		"error_queue", errorSubject,
+		"task_type", taskTypeSegment,
+	)
+
+	// Graceful shutdown по SIGINT / SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	<-ctx.Done()
+	slog.Info("получен сигнал завершения, остановка агента")
+	nc.Drain()
+	slog.Info("агент завершил работу")
 }
 
 // handleTask обрабатывает входящее сообщение из NATS.
-func handleTask(msg *nats.Msg) {
+func handleTask(nc *nats.Conn, msg *nats.Msg) {
+	log := slog.With("subject", msg.Subject)
+
 	var task Task
 	if err := json.Unmarshal(msg.Data, &task); err != nil {
-		log.Printf("[segment-agent] ошибка парсинга задачи: %v", err)
-		publishError(msg.Reply, "", "невалидный JSON: "+err.Error())
+		log.Error("ошибка десериализации задачи", "error", err)
+		publishError(nc, msg.Reply, "", "", "невалидный JSON: "+err.Error())
 		return
 	}
 
-	log.Printf("[segment-agent] получена задача: task_id=%s, type=%s, clients=%d",
-		task.TaskID, task.Type, len(task.Clients))
+	log = log.With("task_id", task.TaskID, "type", task.Type, "clients", len(task.Clients))
+	log.Info("получена задача на сегментацию")
 
 	// Фильтр: обрабатываем только задачи типа "segment".
 	if task.Type != taskTypeSegment {
-		log.Printf("[segment-agent] пропуск задачи type=%s (ожидался %s)", task.Type, taskTypeSegment)
+		log.Warn("пропуск задачи — неверный тип")
+		publishError(nc, msg.Reply, task.TaskID, task.Type,
+			"ожидался тип 'segment', получен '"+task.Type+"'")
 		return
 	}
 
 	if len(task.Clients) == 0 {
-		log.Printf("[segment-agent] пустой список клиентов в задаче %s", task.TaskID)
-		publishError(task.TaskID, task.Type, "список клиентов пуст")
+		log.Error("пустой список клиентов")
+		publishError(nc, msg.Reply, task.TaskID, task.Type,
+			"список клиентов пуст")
 		return
 	}
 
 	// Выполнение сегментации.
 	segments := segment(task.Clients)
+	log.Info("сегментация завершена", "segments", len(segments))
 
 	result := Result{
 		TaskID:   task.TaskID,
@@ -90,39 +116,76 @@ func handleTask(msg *nats.Msg) {
 		Status:   "completed",
 	}
 
-	// Публикация результата.
-	publishResult(msg, result)
+	publishResult(nc, msg, result, log)
 }
 
-// publishResult публикует результат сегментации в tasks.completed.
-// Если msg.Reply не пустой, отвечаем напрямую (request-reply),
-// иначе публикуем в publishSubject.
-func publishResult(msg *nats.Msg, result Result) {
+// publishResult публикует успешный результат сегментации.
+// Если msg.Reply не пустой — используем request-reply;
+// иначе публикуем в tasks.completed.
+func publishResult(nc *nats.Conn, msg *nats.Msg, result Result, log *slog.Logger) {
 	data, err := json.Marshal(result)
 	if err != nil {
-		log.Printf("[segment-agent] ошибка сериализации результата: %v", err)
+		log.Error("ошибка сериализации результата", "error", err)
 		return
 	}
 
-	subject := publishSubject
+	// Request-reply: отвечаем напрямую отправителю.
 	if msg.Reply != "" {
-		subject = msg.Reply
-	}
-
-	if err := msg.Respond(data); err != nil {
-		log.Printf("[segment-agent] ошибка публикации ответа в %s: %v", subject, err)
+		if err := msg.Respond(data); err != nil {
+			log.Error("ошибка respond", "reply", msg.Reply, "error", err)
+		}
+		log.Info("результат отправлен через request-reply",
+			"reply", msg.Reply, "segments", len(result.Segments))
 		return
 	}
 
-	log.Printf("[segment-agent] результат опубликован в %s: task_id=%s, сегментов=%d",
-		subject, result.TaskID, len(result.Segments))
+	// Публикация в очередь tasks.completed.
+	if err := nc.Publish(publishSubject, data); err != nil {
+		log.Error("ошибка публикации результата",
+			"subject", publishSubject, "error", err)
+		return
+	}
+
+	log.Info("результат опубликован", "subject", publishSubject,
+		"segments", len(result.Segments))
+
 	for _, s := range result.Segments {
-		log.Printf("  -> %s: %d клиентов", s.Name, s.Count)
+		log.Info("  сегмент", "name", s.Name, "count", s.Count)
 	}
 }
 
-// publishError публикует результат с ошибкой.
-func publishError(taskID, taskType, errMsg string) {
-	// При ошибке нет ссылки на msg, логируем только локально.
-	log.Printf("[segment-agent] ОШИБКА task_id=%s: %s", taskID, errMsg)
+// publishError публикует ошибку обработки задачи.
+// Если задан reply-канал — отвечаем через request-reply.
+// В любом случае дублируем ошибку в очередь tasks.error.
+func publishError(nc *nats.Conn, reply, taskID, taskType, errMsg string) {
+	log := slog.With("task_id", taskID)
+
+	result := Result{
+		TaskID: taskID,
+		Type:   taskType,
+		Status: "error",
+		Error:  errMsg,
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		log.Error("ошибка сериализации ошибки", "error", err)
+		return
+	}
+
+	// Request-reply: отвечаем напрямую отправителю.
+	if reply != "" {
+		if err := nc.Publish(reply, data); err != nil {
+			log.Error("ошибка публикации ошибки в reply",
+				"reply", reply, "error", err)
+		}
+	}
+
+	// Публикация в очередь tasks.error.
+	if err := nc.Publish(errorSubject, data); err != nil {
+		log.Error("ошибка публикации в очередь ошибок",
+			"subject", errorSubject, "error", err)
+	}
+
+	log.Error("задача завершилась ошибкой", "error", errMsg)
 }

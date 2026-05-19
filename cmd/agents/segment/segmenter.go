@@ -1,5 +1,9 @@
 package main
 
+import (
+	"log/slog"
+)
+
 const minSegmentSize = 100
 
 // ageGroups определяет возрастные диапазоны для сегментации.
@@ -33,7 +37,12 @@ func segmentByAge(clients []Client) []Segment {
 	var segments []Segment
 	for _, g := range ageGroups {
 		group, ok := buckets[g.name]
-		if !ok || len(group) < minSegmentSize {
+		if !ok {
+			continue
+		}
+		if len(group) < minSegmentSize {
+			slog.Warn("возрастной сегмент слишком мал, пропущен",
+				"group", g.name, "count", len(group), "min", minSegmentSize)
 			continue
 		}
 		segments = append(segments, Segment{
@@ -58,6 +67,8 @@ func segmentByRegion(clients []Client) []Segment {
 	var segments []Segment
 	for region, group := range buckets {
 		if len(group) < minSegmentSize {
+			slog.Warn("региональный сегмент слишком мал, пропущен",
+				"region", region, "count", len(group), "min", minSegmentSize)
 			continue
 		}
 		segments = append(segments, Segment{
