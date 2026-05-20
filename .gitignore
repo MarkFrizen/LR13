@@ -30,3 +30,9 @@ venv/
 
 # Logs
 *.log
+
+# Go compiled binaries (built by Docker multi-stage, committed by mistake)
+/cmd/agents/analytics/analytics
+/cmd/agents/campaign/campaign
+/cmd/agents/optimizer/optimizer
+/cmd/agents/segment/segment
